@@ -47,5 +47,10 @@ if [ -n "${GITHUB_ENV:-}" ]; then
     echo "ANDROID_HOST_CC=gcc-14"
     echo "ANDROID_HOST_CXX=g++-14"
     echo "JAVA_HOME=${JAVA_HOME_17_X64:-/usr/lib/jvm/temurin-17-jdk-amd64}"
+    # The runner image presets these to its own default NDK, and env.sh honours them
+    # over its pinned version. Point them at the pinned one.
+    echo "ANDROID_NDK_ROOT=$SDK/ndk/$NDK_VERSION"
+    echo "ANDROID_NDK_HOME=$SDK/ndk/$NDK_VERSION"
+    echo "ANDROID_NDK=$SDK/ndk/$NDK_VERSION"
   } >> "$GITHUB_ENV"
 fi

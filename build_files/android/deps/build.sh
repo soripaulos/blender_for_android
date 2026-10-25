@@ -342,13 +342,16 @@ build_pystring() {
   cmake_install "$src" pystring
 }
 
+# MZ_PPMD as in upstream's minizipng.cmake: 4.2 turns it on by default and downloads
+# 7-Zip's sources for it mid-configure, and the Ppmd8 objects never reach the static
+# library, so OpenColorIO then fails to link with undefined Ppmd8_* symbols.
 build_minizipng() {
   local v; v="$(dep_version MINIZIPNG_VERSION)"
   fetch "minizip-ng-$v.tar.gz" "https://github.com/zlib-ng/minizip-ng/archive/$v.tar.gz"
   local src; src="$(extract "minizip-ng-$v.tar.gz" minizipng)"
   cmake_install "$src" minizipng \
     -DMZ_FETCH_LIBS=OFF -DMZ_LIBCOMP=OFF -DMZ_PKCRYPT=OFF -DMZ_WZAES=OFF \
-    -DMZ_OPENSSL=OFF -DMZ_SIGNING=OFF -DMZ_LZMA=OFF -DMZ_ZSTD=OFF \
+    -DMZ_OPENSSL=OFF -DMZ_SIGNING=OFF -DMZ_PPMD=OFF -DMZ_LZMA=OFF -DMZ_ZSTD=OFF \
     -DMZ_BZIP2=OFF -DMZ_ICONV=OFF
 }
 
