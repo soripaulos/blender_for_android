@@ -1,0 +1,136 @@
+# SPDX-FileCopyrightText: 2026 Blender Authors
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# One attempt at compiling Blender and packaging the APK, called by android-apk.yml.
+# All compiles go through ccache and the cache is kept between stages, so a stage that
+# runs out of time hands over to the next one, which replays the finished objects and
+# continues (build_files/android/ci/build_stage.sh).
+
+name: Android APK stage
+
+on:
+  workflow_call:
+    inputs:
+      stage:
+        type: number
+        required: true
+      config:
+        type: string
+        required: true
+      deps-key:
+        type: string
+        required: true
+      last:
+        type: boolean
+        default: false
+    outputs:
+      built:
+        value: ${{ jobs.apk.outputs.built }}
+    secrets:
+      ANDROID_KEYSTORE_BASE64:
+        required: false
+
+jobs:
+  apk:
+    name: Blender ${{ inputs.config }} APK (stage ${{ inputs.stage }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      BUILD_BASE: /mnt/bb
+      GH_TOKEN: ${{ github.token }}
+      CCACHE_DIR: /mnt/bb/ccache
+      CCACHE_PREFIX_KEY: ccache-${{ inputs.config }}-
+      # Secrets cannot appear in an if:, but a job variable derived from one can.
+      HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+    outputs:
+      built: ${{ steps.build.outputs.built }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Build directory
+        run: sudo mkdir -p "$BUILD_BASE" && sudo chown "$(id -u):$(id -g)" "$BUILD_BASE"
+
+      - name: Restore dependency prefix
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ env.BUILD_BASE }}/lib/android_arm64
+            ${{ env.BUILD_BASE }}/android_deps_build/host
+            ${{ env.BUILD_BASE }}/android_deps_build/work/python-host-install
+          key: ${{ inputs.deps-key }}
+          fail-on-cache-miss: true
+
+      - name: Set up runner
+        run: bash build_files/android/ci/setup_runner.sh
+
+      - name: Fetch precompiled host libraries
+        run: bash build_files/android/ci/fetch_host_libs.sh
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.CCACHE_PREFIX_KEY }}${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.stage }}
+          restore-keys: ${{ env.CCACHE_PREFIX_KEY }}
+
+      # A stable signing key lets each CI build install over the previous one. Use your
+      # own with the ANDROID_KEYSTORE_BASE64 secret (a keystore with password "android"
+      # and alias "androiddebugkey", which is what package.sh signs with); otherwise one
+      # is generated once and kept in the cache.
+      - name: Signing key from secret
+        id: secret-key
+        if: env.HAS_KEYSTORE == 'true'
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: echo "$KEYSTORE" | base64 -d > "$BUILD_BASE/android-debug.keystore"
+
+      - name: Restore signing key
+        id: cached-key
+        if: steps.secret-key.outcome == 'skipped'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.BUILD_BASE }}/android-debug.keystore
+          key: android-signing-keystore-v1
+
+      - name: Build
+        id: build
+        run: bash build_files/android/ci/build_stage.sh 280 "${{ inputs.config }}" dist
+
+      - name: Save signing key
+        # package.sh creates the key while signing, so it only exists after a finished build.
+        if: steps.cached-key.outcome == 'success' && steps.cached-key.outputs.cache-hit != 'true' && steps.build.outputs.built == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.BUILD_BASE }}/android-debug.keystore
+          key: android-signing-keystore-v1
+
+      - name: Save compiler cache
+        if: always() && steps.build.outcome != 'skipped'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.CCACHE_PREFIX_KEY }}${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.stage }}
+
+      - name: Drop superseded compiler caches
+        if: always() && steps.build.outcome != 'skipped'
+        run: >
+          bash build_files/android/ci/prune_caches.sh "$CCACHE_PREFIX_KEY"
+          "${CCACHE_PREFIX_KEY}${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.stage }}"
+
+      - name: Upload APK
+        if: steps.build.outputs.built == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-android-${{ inputs.config }}
+          path: dist/
+          compression-level: 0
+          retention-days: 30
+
+      - name: Out of stages
+        if: inputs.last && steps.build.outcome == 'success' && steps.build.outputs.built != 'true'
+        run: |
+          echo "::error::Blender did not finish compiling in the stages available. The compiler cache is saved: re-run the workflow and it continues quickly."
+          exit 1

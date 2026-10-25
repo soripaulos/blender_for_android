@@ -1,0 +1,188 @@
+# SPDX-FileCopyrightText: 2026 Blender Authors
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Build the Blender for Android APK.
+#
+#   checks  -> fast: the Termux remote control tests, the Java and the manifest
+#   deps-N  -> the cross-compiled dependency prefix, in time-boxed stages, cached
+#   apk-N   -> Blender itself and the APK, in time-boxed stages sharing a ccache
+#   release -> on a v* tag (or when asked), a GitHub release with the APK
+#
+# The first run is long: the ~70 dependencies alone take many runner hours. They are
+# cached by the hash of their recipes, so later runs skip straight to compiling Blender,
+# and the compiler cache makes that incremental too.
+#
+# Optional secret ANDROID_KEYSTORE_BASE64: a keystore (password "android", alias
+# "androiddebugkey") to sign with, e.g. to keep the signature of an APK you already
+# installed. Without it a key is generated once and reused from the cache.
+
+name: Android APK
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+    paths-ignore:
+      - '**.md'
+      - 'doc/**'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'doc/**'
+  workflow_dispatch:
+    inputs:
+      config:
+        description: Feature set
+        type: choice
+        options: [full, lite]
+        default: full
+      release:
+        description: Publish the APK as a GitHub release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write  # the release job
+  actions: write   # pruning superseded caches
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Remote control tests
+        run: python build_files/android/termux/test_remote_control.py
+
+      # Termux ships its own Python; keep the client working on older ones too.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: blender-cli runs on Python 3.9
+        run: |
+          python -m py_compile scripts/modules/_bpy_internal/remote_control/blender_cli.py
+          python scripts/modules/_bpy_internal/remote_control/blender_cli.py --help > /dev/null
+
+      - name: Shell scripts parse
+        run: for f in build_files/android/ci/*.sh build_files/android/apk/package.sh; do bash -n "$f"; done
+
+      - name: Java and manifest
+        run: |
+          SDK="$ANDROID_SDK_ROOT"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "build-tools;35.0.1" "platforms;android-35" > /dev/null
+          JAR="$SDK/platforms/android-35/android.jar"
+          BT="$SDK/build-tools/35.0.1"
+          APP=build_files/android/apk/app/src/main
+          OUT="$RUNNER_TEMP/apkcheck"
+          mkdir -p "$OUT/classes" "$OUT/dex" "$OUT/assets"
+          "$JAVA_HOME_17_X64/bin/javac" -classpath "$JAR" -source 17 -target 17 -d "$OUT/classes" "$APP"/java/org/blender/blender/*.java
+          "$BT/d8" --min-api 31 --lib "$JAR" --output "$OUT/dex" $(find "$OUT/classes" -name '*.class')
+          "$BT/aapt2" compile --dir "$APP/res" -o "$OUT/res.zip"
+          "$BT/aapt2" link -o "$OUT/base.apk" -I "$JAR" --manifest "$APP/AndroidManifest.xml" "$OUT/res.zip" \
+            -A "$OUT/assets" --min-sdk-version 31 --target-sdk-version 34
+
+  plan:
+    name: Plan
+    needs: checks
+    # A pull request from a branch of this repository is already built by its push;
+    # building it twice would double hours of runner time.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    outputs:
+      deps-key: ${{ steps.key.outputs.deps-key }}
+      config: ${{ steps.key.outputs.config }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache keys
+        id: key
+        run: |
+          echo "deps-key=android-deps-v1-${{ hashFiles('build_files/android/deps/**', 'build_files/android/env.sh', 'build_files/build_environment/cmake/versions.cmake', 'build_files/build_environment/patches/**') }}" >> "$GITHUB_OUTPUT"
+          echo "config=${{ inputs.config || 'full' }}" >> "$GITHUB_OUTPUT"
+
+  # Five stages of up to ~5 hours each. A stage only runs when the one before it ran
+  # and did not finish; once the prefix is cached, stage 1 restores it and the rest skip.
+  deps-1:
+    needs: plan
+    uses: ./.github/workflows/android-deps-stage.yml
+    with: {stage: 1, deps-key: '${{ needs.plan.outputs.deps-key }}'}
+  deps-2:
+    needs: [plan, deps-1]
+    if: ${{ !cancelled() && needs.deps-1.result == 'success' && needs.deps-1.outputs.complete != 'true' }}
+    uses: ./.github/workflows/android-deps-stage.yml
+    with: {stage: 2, deps-key: '${{ needs.plan.outputs.deps-key }}'}
+  deps-3:
+    needs: [plan, deps-2]
+    if: ${{ !cancelled() && needs.deps-2.result == 'success' && needs.deps-2.outputs.complete != 'true' }}
+    uses: ./.github/workflows/android-deps-stage.yml
+    with: {stage: 3, deps-key: '${{ needs.plan.outputs.deps-key }}'}
+  deps-4:
+    needs: [plan, deps-3]
+    if: ${{ !cancelled() && needs.deps-3.result == 'success' && needs.deps-3.outputs.complete != 'true' }}
+    uses: ./.github/workflows/android-deps-stage.yml
+    with: {stage: 4, deps-key: '${{ needs.plan.outputs.deps-key }}'}
+  deps-5:
+    needs: [plan, deps-4]
+    if: ${{ !cancelled() && needs.deps-4.result == 'success' && needs.deps-4.outputs.complete != 'true' }}
+    uses: ./.github/workflows/android-deps-stage.yml
+    with: {stage: 5, deps-key: '${{ needs.plan.outputs.deps-key }}', last: true}
+
+  apk-1:
+    needs: [plan, deps-1, deps-2, deps-3, deps-4, deps-5]
+    if: >-
+      ${{ !cancelled() && (needs.deps-1.outputs.complete == 'true' || needs.deps-2.outputs.complete == 'true' ||
+      needs.deps-3.outputs.complete == 'true' || needs.deps-4.outputs.complete == 'true' ||
+      needs.deps-5.outputs.complete == 'true') }}
+    uses: ./.github/workflows/android-apk-stage.yml
+    with: {stage: 1, config: '${{ needs.plan.outputs.config }}', deps-key: '${{ needs.plan.outputs.deps-key }}'}
+    secrets: inherit
+  apk-2:
+    needs: [plan, apk-1]
+    if: ${{ !cancelled() && needs.apk-1.result == 'success' && needs.apk-1.outputs.built != 'true' }}
+    uses: ./.github/workflows/android-apk-stage.yml
+    with: {stage: 2, config: '${{ needs.plan.outputs.config }}', deps-key: '${{ needs.plan.outputs.deps-key }}', last: true}
+    secrets: inherit
+
+  release:
+    name: Release
+    needs: [plan, apk-1, apk-2]
+    if: >-
+      ${{ !cancelled() && (needs.apk-1.outputs.built == 'true' || needs.apk-2.outputs.built == 'true') &&
+      (startsWith(github.ref, 'refs/tags/v') || inputs.release) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: blender-android-${{ needs.plan.outputs.config }}
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('android-build-{0}', github.run_number) }}
+          name: Blender for Android ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build {0}', github.run_number) }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*
+          body: |
+            Blender for Android (${{ needs.plan.outputs.config }}), built from ${{ github.sha }}.
+
+            **Install:** download the `.apk` and open it (allow installing from unknown sources).
+            If an APK signed with a different key is installed, uninstall it first.
+
+            **Control it from Termux:** in Blender open Preferences > System > Remote Control,
+            press *Copy Setup Command*, and paste the line into Termux. Then for example:
+
+                blender-cli --python build.py
+                blender-cli scene.blend -o renders/frame_#### -a
+
+            See ANDROID_TERMUX_CLI.md for everything blender-cli can do.

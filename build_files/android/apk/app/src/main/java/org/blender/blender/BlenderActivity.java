@@ -14,6 +14,8 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.ParcelFileDescriptor;
 import android.os.storage.StorageManager;
 import android.os.storage.StorageVolume;
@@ -36,6 +38,7 @@ import android.view.inputmethod.InputMethodManager;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -77,6 +80,19 @@ public class BlenderActivity extends NativeActivity {
 
   private InputView inputView;
 
+  /* Written by the remote control server while it runs; see RemoteControlService. */
+  private static final String REMOTE_MARKER = "remote_control.active";
+  private static final long REMOTE_POLL_MS = 2000;
+  private final Handler remoteHandler = new Handler(Looper.getMainLooper());
+  private boolean remoteServiceRunning = false;
+  private final Runnable remotePoll = new Runnable() {
+    @Override
+    public void run() {
+      updateRemoteControlService();
+      remoteHandler.postDelayed(this, REMOTE_POLL_MS);
+    }
+  };
+
   private native void nativeOnCommitText(String text);
   private native void nativeOnKey(
       int keycode, int action, int metaState, int unicode, boolean repeat);
@@ -90,6 +106,7 @@ public class BlenderActivity extends NativeActivity {
      * and Blender reads both of these during its Python initialization. */
     setUpPythonInterpreter();
     publishHardwareNames();
+    publishFilesDir();
     /* Also before super.onCreate(): the glue reads this while building argv. */
     publishLaunchFile(getIntent());
     super.onCreate(state);
@@ -101,6 +118,61 @@ public class BlenderActivity extends NativeActivity {
     /* Delivered on this (the UI) thread, like showKeyboard()'s work. */
     ((InputManager)getSystemService(Context.INPUT_SERVICE))
         .registerInputDeviceListener(keyboardListener, null);
+    remoteHandler.post(remotePoll);
+  }
+
+  /* Where the remote control server keeps its workspace and marker file. Python has no
+   * other way to learn the app's files directory without JNI. */
+  private void publishFilesDir() {
+    try {
+      Os.setenv("BLENDER_ANDROID_FILES_DIR", getFilesDir().getAbsolutePath(), true);
+    }
+    catch (Exception ex) {
+      Log.w(TAG, "cannot publish files dir", ex);
+    }
+  }
+
+  /* Follow the remote control server: hold a foreground service while it runs, so the
+   * process is not frozen once the user switches to Termux. The server says it is up by
+   * writing its PID to the marker; a marker with another PID is left over from a process
+   * that was killed and is ignored. A stat every two seconds costs nothing, and polling
+   * keeps Python free of any JNI. */
+  private void updateRemoteControlService() {
+    boolean active = remoteMarkerIsLive();
+    if (active == remoteServiceRunning) {
+      return;
+    }
+    Intent intent = new Intent(this, RemoteControlService.class);
+    try {
+      if (active) {
+        startForegroundService(intent);
+      }
+      else {
+        stopService(intent);
+      }
+      remoteServiceRunning = active;
+    }
+    catch (Exception ex) {
+      /* Starting from the background is refused on API 31+; retried on the next poll,
+       * which succeeds once Blender is in front again. */
+      Log.w(TAG, "remote control service: " + ex);
+    }
+  }
+
+  private boolean remoteMarkerIsLive() {
+    File marker = new File(getFilesDir(), REMOTE_MARKER);
+    if (!marker.isFile()) {
+      return false;
+    }
+    try (FileInputStream in = new FileInputStream(marker)) {
+      byte[] buffer = new byte[32];
+      int n = in.read(buffer);
+      String pid = n > 0 ? new String(buffer, 0, n, "UTF-8").trim() : "";
+      return pid.equals(Integer.toString(android.os.Process.myPid()));
+    }
+    catch (Exception ex) {
+      return false;
+    }
   }
 
   /* Scoped storage confines the app to its sandbox, but Blender opens and saves
@@ -704,6 +776,11 @@ public class BlenderActivity extends NativeActivity {
   protected void onDestroy() {
     ((InputManager)getSystemService(Context.INPUT_SERVICE))
         .unregisterInputDeviceListener(keyboardListener);
+    remoteHandler.removeCallbacks(remotePoll);
+    if (remoteServiceRunning) {
+      stopService(new Intent(this, RemoteControlService.class));
+      remoteServiceRunning = false;
+    }
     super.onDestroy();
   }
 

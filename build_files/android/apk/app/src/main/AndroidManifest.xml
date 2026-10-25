@@ -21,6 +21,12 @@
     <!-- Blender reads and writes .blend files and their assets by path, so it needs
          access to shared storage rather than the scoped, app-private sandbox. -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!-- Remote control from Termux: a foreground service keeps Blender from being frozen
+         by the cached-apps freezer while the user is in the terminal. See
+         RemoteControlService.java. specialUse because no other type describes a local
+         scripting server; it requires the subtype property on the service below. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <application
         android:label="Blender"
@@ -156,5 +162,14 @@
                     android:mimeType="*/*" android:pathPrefix="/external_primary/downloads" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name="org.blender.blender.RemoteControlService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Local scripting server: lets a terminal app on the same device run Python scripts in Blender" />
+        </service>
     </application>
 </manifest>

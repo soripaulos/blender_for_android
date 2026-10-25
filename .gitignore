@@ -14,6 +14,8 @@
 !.clang-tidy
 !.editorconfig
 !.well-known/
+# CI workflows (the Android APK build).
+!.github/
 
 # The agent skills are versioned; the local agent settings are not. Three of the
 # skills were already in the repository, added past this rule with `git add -f`,

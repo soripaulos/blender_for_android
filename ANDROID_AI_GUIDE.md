@@ -524,6 +524,26 @@ reproduce each failure from the shell.
 | The work itself: a native operator that hands the URL to an `ACTION_VIEW` intent over JNI. It **reports an error when the intent is refused**, which matters more than it looks -- the failure it replaces was completely silent, and a link that fails loudly is a bug report instead of a shrug | [wm_operators.cc](source/blender/windowmanager/intern/wm_operators.cc) `WM_OT_platform_url_open`, [GHOST_SystemAndroid.cc](intern/ghost/intern/GHOST_SystemAndroid.cc) `GHOST_android_open_url()`, [BlenderActivity.java](build_files/android/apk/app/src/main/java/org/blender/blender/BlenderActivity.java) `openUrl()` |
 | `GHOST_android_open_url` is declared at its use site rather than in a header, because the window manager cannot include GHOST's private headers. `creator.cc` reaches `GHOST_HACK_getFirstFile` the same way on macOS | [wm_operators.cc](source/blender/windowmanager/intern/wm_operators.cc) |
 
+## Remote control from Termux
+
+A desktop Blender is scripted from a shell; this one has no shell and no `argv`. A
+loopback server inside Blender, off until the user starts it and guarded by a token,
+takes requests from `blender-cli` in Termux and runs them on the main thread with the
+context a `--python` script gets. `blender-cli` accepts Blender's own arguments (`-P`,
+`--python-expr`, `-o`, `-f`, `-a`, `-E`, ...) in order, and moves files across the
+Termux/Blender sandbox boundary itself. Full write-up: [ANDROID_TERMUX_CLI.md](ANDROID_TERMUX_CLI.md).
+
+| Change | Where |
+| --- | --- |
+| Server and wire protocol, kept free of `bpy` so it can be tested with a plain interpreter | [server.py](scripts/modules/_bpy_internal/remote_control/server.py) |
+| Main-thread executor, config and token, the one-line Termux installer served over HTTP | [remote_control/\_\_init\_\_.py](scripts/modules/_bpy_internal/remote_control/__init__.py) |
+| The client, standalone and stdlib-only, served to Termux by the server itself | [blender_cli.py](scripts/modules/_bpy_internal/remote_control/blender_cli.py) |
+| Preferences > System > Remote Control | [bl_android_remote_control.py](scripts/startup/bl_android_remote_control.py) |
+| A foreground service while serving: without it the cached-apps freezer stops the process seconds after the user switches to Termux. Driven by a PID marker file the activity polls, so Python needs no JNI | [RemoteControlService.java](build_files/android/apk/app/src/main/java/org/blender/blender/RemoteControlService.java), [BlenderActivity.java](build_files/android/apk/app/src/main/java/org/blender/blender/BlenderActivity.java) `updateRemoteControlService()`, [AndroidManifest.xml](build_files/android/apk/app/src/main/AndroidManifest.xml); `package.sh` now compiles every `.java` file in the package |
+| `atexit` stops the server without touching `bpy.context`: at exit the window manager is gone and reaching for it aborts the process (`std::bad_optional_access`) | `_shutdown()` in [bl_android_remote_control.py](scripts/startup/bl_android_remote_control.py) |
+| End-to-end test against a stand-in `bpy`, run in CI | [test_remote_control.py](build_files/android/termux/test_remote_control.py) |
+| CI that builds the APK on hosted runners, in time-boxed cached stages | [android-apk.yml](.github/workflows/android-apk.yml), [build_files/android/ci/](build_files/android/ci/) |
+
 ## Bug fixes
 
 | Fix | Where |
@@ -547,6 +567,7 @@ reproduce each failure from the shell.
 | [ANDROID_MISSING_FEATURES.md](ANDROID_MISSING_FEATURES.md) | What is still missing, audited against the real build |
 | [ANDROID_VIRTUAL_KEYBOARD_STUDY.md](ANDROID_VIRTUAL_KEYBOARD_STUDY.md) | Why the on-screen keyboard is native, and the event path it relies on |
 | [ANDROID_TOUCH_UI_SCALE_STUDY.md](ANDROID_TOUCH_UI_SCALE_STUDY.md) | How only the menus are scaled for a thumb, how the top bar folds into one button, and how a finger scrolls a menu taller than the screen. All built |
+| [ANDROID_TERMUX_CLI.md](ANDROID_TERMUX_CLI.md) | Controlling Blender from Termux with `blender-cli`: setup, the desktop-style arguments, file handling, security, the wire protocol, the foreground service, and the CI workflow that builds the APK |
 | [ANDROID_FILE_ASSOCIATION_STUDY.md](ANDROID_FILE_ASSOCIATION_STUDY.md) | How a `.blend` tapped in a file manager reaches this port: the intent filter and why `android:host` decides whether the suffix is checked at all, the five-rung URI-to-path resolver, and the argv and GHOST-event halves. All built |
 | [.claude/skills/android-document-change/SKILL.md](.claude/skills/android-document-change/SKILL.md) | How to add to these documents when something is built, fixed or taken back out, and why the taken-back-out ones matter most |
 

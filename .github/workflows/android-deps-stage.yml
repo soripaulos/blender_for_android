@@ -1,0 +1,106 @@
+# SPDX-FileCopyrightText: 2026 Blender Authors
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# One stage of the Android dependency build. Called several times in a row by
+# android-apk.yml, because building all ~70 libraries takes longer than the six hours a
+# hosted runner may run one job. Each stage restores what the previous one built, builds
+# for up to five hours (build_files/android/ci/deps_stage.sh), and saves its progress.
+
+name: Android deps stage
+
+on:
+  workflow_call:
+    inputs:
+      stage:
+        type: number
+        required: true
+      deps-key:
+        type: string
+        required: true
+      last:
+        description: Fail instead of handing over when this stage cannot finish.
+        type: boolean
+        default: false
+    outputs:
+      complete:
+        value: ${{ jobs.deps.outputs.complete }}
+
+jobs:
+  deps:
+    name: Dependencies (stage ${{ inputs.stage }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      BUILD_BASE: /mnt/bb
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      complete: ${{ steps.restore.outputs.cache-hit == 'true' && 'true' || steps.stage.outputs.complete }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build directory
+        run: sudo mkdir -p "$BUILD_BASE" && sudo chown "$(id -u):$(id -g)" "$BUILD_BASE"
+
+      - name: Restore dependency prefix
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ env.BUILD_BASE }}/lib/android_arm64
+            ${{ env.BUILD_BASE }}/android_deps_build/host
+            ${{ env.BUILD_BASE }}/android_deps_build/work/python-host-install
+          key: ${{ inputs.deps-key }}
+          restore-keys: ${{ inputs.deps-key }}-partial-
+
+      - name: Set up runner
+        if: steps.restore.outputs.cache-hit != 'true'
+        run: bash build_files/android/ci/setup_runner.sh
+
+      # numpy and USD are driven by a host interpreter of the target's version.
+      - uses: actions/setup-python@v5
+        if: steps.restore.outputs.cache-hit != 'true'
+        with:
+          python-version: '3.13'
+
+      - name: Build dependencies
+        id: stage
+        if: steps.restore.outputs.cache-hit != 'true'
+        run: bash build_files/android/ci/deps_stage.sh 290
+
+      - name: Save completed prefix
+        if: steps.stage.outputs.complete == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ env.BUILD_BASE }}/lib/android_arm64
+            ${{ env.BUILD_BASE }}/android_deps_build/host
+            ${{ env.BUILD_BASE }}/android_deps_build/work/python-host-install
+          key: ${{ inputs.deps-key }}
+
+      # Also after a failure: whatever finished is kept, and a re-run starts from there.
+      - name: Save progress
+        if: always() && steps.stage.outcome != 'skipped' && steps.stage.outputs.complete != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ env.BUILD_BASE }}/lib/android_arm64
+            ${{ env.BUILD_BASE }}/android_deps_build/host
+            ${{ env.BUILD_BASE }}/android_deps_build/work/python-host-install
+          key: ${{ inputs.deps-key }}-partial-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.stage }}
+
+      - name: Drop superseded progress caches
+        if: always() && steps.stage.outcome != 'skipped'
+        run: |
+          if [ "${{ steps.stage.outputs.complete }}" = "true" ]; then
+            keep=""
+          else
+            keep="${{ inputs.deps-key }}-partial-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.stage }}"
+          fi
+          bash build_files/android/ci/prune_caches.sh "${{ inputs.deps-key }}-partial-" "$keep"
+
+      - name: Out of stages
+        if: inputs.last && steps.stage.outcome == 'success' && steps.stage.outputs.complete != 'true'
+        run: |
+          echo "::error::The dependencies did not finish in the stages available. Progress is cached: re-run the workflow to continue."
+          exit 1
